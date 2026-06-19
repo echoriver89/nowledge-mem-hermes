@@ -13,67 +13,110 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Clone upstream and subtree split
         run: |
-          git clone --depth 1 https://github.com/nowledge-co/community /tmp/community
+          git clone https://github.com/nowledge-co/community /tmp/community
           cd /tmp/community
           git subtree split --prefix=nowledge-mem-hermes -b nmem-flat
-          # 导出扁平内容到工作区
-          git worktree add /tmp/nmem-flat nmem-flat
 
-      - name: Sync files via Git Data API
+      - name: Sync via Git Data API
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          REPO="${{ github.repository }}"
-          # 获取当前 HEAD commit 和 tree
-          PARENT_SHA=$(gh api "repos/$REPO/branches/main" --jq '.commit.sha')
-          PARENT_TREE=$(gh api "repos/$REPO/branches/main" --jq '.commit.commit.tree.sha')
+          python3 << 'EOF'
+          import subprocess, json, base64, os
+          from pathlib import Path
 
-          # 创建 blobs
-          TREE_ENTRIES="[]"
-          cd /tmp/nmem-flat
-          for f in $(git ls-tree -r --name-only nmem-flat); do
-            CONTENT=$(base64 -w 0 < "$f" 2>/dev/null || git show "nmem-flat:$f" | base64 -w 0)
-            BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
-              --method POST \
-              --field "content=$CONTENT" \
-              --field "encoding=base64" \
-              --jq '.sha')
-            ENTRY=$(jq -n \
-              --arg path "$f" \
-              --arg sha "$BLOB_SHA" \
-              '{path: $path, mode: "100644", type: "blob", sha: $sha}')
-            TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq --argjson e "$ENTRY" '. + [$e]')
-          done
+          REPO = os.environ['GITHUB_REPOSITORY']  # echoriver89/nowledge-mem-hermes
+          BRANCH = 'main'
+          UPSTREAM_REPO = '/tmp/community'
 
-          # 创建 tree
-          TREE_SHA=$(gh api "repos/$REPO/git/trees" \
-            --method POST \
-            --field "base_tree=$PARENT_TREE" \
-            --field "tree=$(echo $TREE_ENTRIES | jq -c '.')" \
-            --jq '.sha')
+          def gh_api(endpoint, method='GET', payload=None):
+              cmd = ['gh', 'api', '-H', 'Accept: application/vnd.github+json', endpoint]
+              if method != 'GET':
+                  cmd.extend(['--method', method])
+              if payload is not None:
+                  cmd.extend(['--input', '-'])
+              result = subprocess.run(cmd, input=json.dumps(payload) if payload else None,
+                                    capture_output=True, text=True, timeout=120)
+              if result.returncode != 0:
+                  raise RuntimeError(f"gh api {endpoint} failed: rc={result.returncode}\nstderr={result.stderr}\nstdout={result.stdout}")
+              return json.loads(result.stdout) if result.stdout.strip() else {}
 
-          # 创建 commit
-          COMMIT_SHA=$(gh api "repos/$REPO/git/commits" \
-            --method POST \
-            --field "message=Sync from nowledge-co/community (auto)" \
-            --field "tree=$TREE_SHA" \
-            --field "parents[]=$PARENT_SHA" \
-            --jq '.sha')
+          # 1. 获取文件列表
+          print("===1. 获取 nmem-flat 文件列表===")
+          result = subprocess.run(
+              ['git', 'ls-tree', '-r', '--name-only', 'nmem-flat'],
+              capture_output=True, text=True, cwd=UPSTREAM_REPO
+          )
+          files = [f for f in result.stdout.strip().split('\n') if f]
+          print(f"文件数: {len(files)}")
 
-          # 更新 main ref
-          gh api "repos/$REPO/git/refs/heads/main" \
-            --method PATCH \
-            --field "sha=$COMMIT_SHA"
+          # 2. 获取当前 fork HEAD（作为 parent）
+          print("\n===2. 获取 fork HEAD===")
+          branch_resp = gh_api(f'repos/{REPO}/branches/{BRANCH}')
+          parent_sha = branch_resp['commit']['sha']
+          parent_tree = branch_resp['commit']['commit']['tree']['sha']
+          print(f"parent: {parent_sha[:8]}, tree: {parent_tree[:8]}")
 
-          echo "Synced. New HEAD: $COMMIT_SHA"
+          # 3. 创建 blobs
+          print("\n===3. 创建 blobs===")
+          tree_entries = []
+          for filepath in files:
+              result = subprocess.run(
+                  ['git', 'show', f'nmem-flat:{filepath}'],
+                  capture_output=True, cwd=UPSTREAM_REPO
+              )
+              content = result.stdout
+              is_binary = b'\x00' in content
+              if is_binary:
+                  encoding = 'base64'
+                  data = base64.b64encode(content).decode()
+              else:
+                  encoding = 'utf-8'
+                  data = content.decode('utf-8', errors='replace')
+
+              resp = gh_api(f'repos/{REPO}/git/blobs', method='POST',
+                           payload={'content': data, 'encoding': encoding})
+              sha = resp.get('sha')
+              if not sha:
+                  raise RuntimeError(f"创建 blob 失败: {filepath}: {resp}")
+              tree_entries.append({
+                  'path': filepath,
+                  'mode': '100644',
+                  'type': 'blob',
+                  'sha': sha
+              })
+              print(f"  \u2713 {filepath} \u2192 {sha[:8]}")
+
+          # 4. 创建 tree
+          print(f"\n===4. 创建 tree（{len(tree_entries)} entries）===")
+          tree_resp = gh_api(f'repos/{REPO}/git/trees', method='POST',
+                            payload={'base_tree': parent_tree, 'tree': tree_entries})
+          tree_sha = tree_resp.get('sha')
+          print(f"tree: {tree_sha}")
+
+          # 5. 创建 commit
+          print("\n===5. 创建 commit===")
+          commit_resp = gh_api(f'repos/{REPO}/git/commits', method='POST', payload={
+              'message': f'Sync from nowledge-co/community (auto, {len(files)} files)',
+              'tree': tree_sha,
+              'parents': [parent_sha]
+          })
+          commit_sha = commit_resp.get('sha')
+          print(f"commit: {commit_sha}")
+
+          # 6. 检查是否有变化（新 commit 和 parent 是否相同）
+          if commit_sha == parent_sha:
+              print("\n\u2713 无变化，已是最新")
+          else:
+              # 7. 更新 main 分支引用
+              print("\n===6. 更新 main 分支引用===")
+              ref_resp = gh_api(f'repos/{REPO}/git/refs/heads/{BRANCH}', method='PATCH',
+                               payload={'sha': commit_sha})
+              print(f"ref updated: {ref_resp.get('ref')} \u2192 {commit_sha[:8]}")
+              print(f"\n\u2713 同步完成！")
 
       - name: Cleanup
-        run: rm -rf /tmp/community /tmp/nmem-flat
+        if: always()
+        run: rm -rf /tmp/community
