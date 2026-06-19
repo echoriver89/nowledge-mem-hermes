@@ -1,0 +1,79 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每天 UTC 6:00（北京时间 14:00）
+    - cron: '0 6 * * *'
+  workflow_dispatch:  # 手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone upstream and subtree split
+        run: |
+          git clone --depth 1 https://github.com/nowledge-co/community /tmp/community
+          cd /tmp/community
+          git subtree split --prefix=nowledge-mem-hermes -b nmem-flat
+          # 导出扁平内容到工作区
+          git worktree add /tmp/nmem-flat nmem-flat
+
+      - name: Sync files via Git Data API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          # 获取当前 HEAD commit 和 tree
+          PARENT_SHA=$(gh api "repos/$REPO/branches/main" --jq '.commit.sha')
+          PARENT_TREE=$(gh api "repos/$REPO/branches/main" --jq '.commit.commit.tree.sha')
+
+          # 创建 blobs
+          TREE_ENTRIES="[]"
+          cd /tmp/nmem-flat
+          for f in $(git ls-tree -r --name-only nmem-flat); do
+            CONTENT=$(base64 -w 0 < "$f" 2>/dev/null || git show "nmem-flat:$f" | base64 -w 0)
+            BLOB_SHA=$(gh api "repos/$REPO/git/blobs" \
+              --method POST \
+              --field "content=$CONTENT" \
+              --field "encoding=base64" \
+              --jq '.sha')
+            ENTRY=$(jq -n \
+              --arg path "$f" \
+              --arg sha "$BLOB_SHA" \
+              '{path: $path, mode: "100644", type: "blob", sha: $sha}')
+            TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq --argjson e "$ENTRY" '. + [$e]')
+          done
+
+          # 创建 tree
+          TREE_SHA=$(gh api "repos/$REPO/git/trees" \
+            --method POST \
+            --field "base_tree=$PARENT_TREE" \
+            --field "tree=$(echo $TREE_ENTRIES | jq -c '.')" \
+            --jq '.sha')
+
+          # 创建 commit
+          COMMIT_SHA=$(gh api "repos/$REPO/git/commits" \
+            --method POST \
+            --field "message=Sync from nowledge-co/community (auto)" \
+            --field "tree=$TREE_SHA" \
+            --field "parents[]=$PARENT_SHA" \
+            --jq '.sha')
+
+          # 更新 main ref
+          gh api "repos/$REPO/git/refs/heads/main" \
+            --method PATCH \
+            --field "sha=$COMMIT_SHA"
+
+          echo "Synced. New HEAD: $COMMIT_SHA"
+
+      - name: Cleanup
+        run: rm -rf /tmp/community /tmp/nmem-flat
