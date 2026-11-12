@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.27] - 2026-11-12
+
+- Refuse HTTP redirects for transcript and Space-roster requests so credentials
+  and conversation content stay at the configured backend.
+
+## [0.5.26] - 2026-11-12
+
+### Fixed
+
+- Declare the exact Space protocol on direct HTTP session synchronization so
+  workspaces using current Spaces can accept captured conversations.
+- Preserve the selected destination; do not fall back to an unscoped write
+  when a configured Space cannot be resolved.
+
 ## [0.5.25] - Unreleased
 
 ### Fixed
